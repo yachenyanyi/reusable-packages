@@ -1,5 +1,4 @@
 from monitoring_kit.adapters.upstream.router import GatewayRouter
-from monitoring_kit.collection.model import UpstreamErrorInfo, UpstreamJobRef, UpstreamState, UpstreamStatus
 from monitoring_kit.collection.ports import UpstreamError
 
 from tests.support import ScriptedGateway, request

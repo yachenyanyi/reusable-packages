@@ -18,6 +18,7 @@ from ..contracts.run import (
     RunRef,
     RunRequest,
     RunStatus,
+    RunSummary,
     WorkSummary,
 )
 from ..errors import (
@@ -28,11 +29,11 @@ from ..errors import (
     InvalidRequestError,
     MonitoringError,
     RunNotFoundError,
-    ScopeMismatchError,
 )
 from ..history.history import ContentHistory
+from ..runtime.model import AllocationRequest
 from ..runtime.registry import ExtensionRegistry
-from ..runtime.ports import AuditSink, TelemetrySink
+from ..runtime.ports import AuditSink, TelemetrySink, WorkAllocator
 from .model import (
     AdapterContext,
     Attempt,
@@ -42,7 +43,13 @@ from .model import (
     ValidationResult,
     observation_from_draft,
 )
-from .ports import CollectionAdapter, RunStateStore, UpstreamError, UpstreamJobGateway
+from .ports import (
+    CollectionAdapter,
+    RunStateConflictError,
+    RunStateStore,
+    UpstreamError,
+    UpstreamJobGateway,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +91,8 @@ class CollectionEngine:
         worker_id: str | None = None,
         audit_sink: AuditSink | None = None,
         telemetry_sink: TelemetrySink | None = None,
+        allocator: WorkAllocator | None = None,
+        global_concurrency_limit: int | None = None,
     ) -> None:
         self._state_store = state_store
         self._history = history
@@ -94,6 +103,11 @@ class CollectionEngine:
         self._worker_id = worker_id or f"worker-{uuid.uuid4()}"
         self._audit_sink = audit_sink
         self._telemetry_sink = telemetry_sink
+        if global_concurrency_limit is not None:
+            if isinstance(global_concurrency_limit, bool) or global_concurrency_limit < 1:
+                raise ValueError("global_concurrency_limit 必须大于 0")
+        self._global_concurrency_limit = global_concurrency_limit
+        self._allocator = allocator or state_store
 
     def submit_run(self, request: RunRequest, context: ExecutionContext) -> RunRef:
         if not isinstance(request, RunRequest) or not isinstance(context, ExecutionContext):
@@ -134,6 +148,11 @@ class CollectionEngine:
             )
         except Exception as exc:
             raise InvalidCollectionSpecError(f"无法构造上游任务规格: {exc}") from exc
+
+        if context.runtime_policy and context.runtime_policy.gateway_limits and upstream_request.gateway_hint is None:
+            raise ConfigurationError(
+                "配置 gateway_limits 时，CollectionAdapter 必须提供可确定的 gateway_hint"
+            )
 
         record = RunRecord(
             run_id=run_id,
@@ -189,23 +208,35 @@ class CollectionEngine:
         if limit < 1:
             raise ValueError("wake 的 limit 必须大于 0")
         now = self._clock.now()
-        records = self._state_store.claim_runnable(
-            now,
-            limit,
-            self._worker_id,
-            self._retry_policy.lease_seconds,
+        records = self._allocator.allocate(
+            AllocationRequest(
+                worker_id=self._worker_id,
+                now=now,
+                batch_size=limit,
+                lease_seconds=self._retry_policy.lease_seconds,
+                global_concurrency_limit=self._global_concurrency_limit,
+            )
         )
         completed = failed = progressed = deferred = 0
         for record in records:
             before = (record.status, record.cursor, record.processed_count, record.failed_count)
             try:
                 self._advance(record)
+            except RunStateConflictError:
+                # 另一个 Worker 已经推进了这个 Run；当前副本不能再写回，
+                # 也不能把它误标为 ENGINE_FAILURE。
+                continue
             except Exception as exc:
-                self._fail_run(record, "ENGINE_FAILURE", str(exc))
-            finally:
+                try:
+                    self._fail_run(record, "ENGINE_FAILURE", str(exc))
+                except RunStateConflictError:
+                    continue
+            try:
                 record.lease_owner = None
                 record.lease_until = None
                 self._state_store.save(record)
+            except RunStateConflictError:
+                continue
             after = (record.status, record.cursor, record.processed_count, record.failed_count)
             if after != before:
                 progressed += 1
@@ -235,7 +266,10 @@ class CollectionEngine:
             if record.status is RunStatus.RUNNING:
                 record.status = RunStatus.QUEUED
             record.updated_at = now
-            self._state_store.save(record)
+            try:
+                self._state_store.save(record)
+            except RunStateConflictError:
+                continue
             recovered += 1
         return RecoverySummary(recovered)
 
@@ -574,11 +608,9 @@ class CollectionEngine:
         self._finish(record, RunStatus.COMPLETED_WITH_ERRORS)
 
     def _get_scoped_record(self, run_id: str, scope_key: str) -> RunRecord:
-        record = self._state_store.get(run_id)
+        record = self._state_store.get(scope_key, run_id)
         if record is None:
             raise RunNotFoundError(f"Run 不存在: {run_id}")
-        if record.scope_key != scope_key:
-            raise ScopeMismatchError("Run 不属于当前 scope")
         return record
 
     def _emit_audit(self, record: RunRecord, action: str, outcome: str) -> None:

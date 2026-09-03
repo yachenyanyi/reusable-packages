@@ -29,7 +29,11 @@ class IngestKey:
     upstream_record_id: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "gateway_key", require_text(self.gateway_key, "ingest_key.gateway_key"))
+        object.__setattr__(
+            self,
+            "gateway_key",
+            require_text(self.gateway_key, "ingest_key.gateway_key", max_length=255),
+        )
         object.__setattr__(
             self,
             "upstream_record_id",

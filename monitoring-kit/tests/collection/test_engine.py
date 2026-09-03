@@ -1,12 +1,12 @@
 import pytest
 
 from monitoring_kit.collection.engine import RetryPolicy
-from monitoring_kit.collection.ports import UpstreamError
+from monitoring_kit.collection.ports import RunStateConflictError, UpstreamError
 from monitoring_kit.contracts import ChangeQuery, ExecutionContext, ExecutionLimits, RunStatus, TypedEnvelope
 from monitoring_kit.errors import (
     IdempotencyConflictError,
     InvalidCollectionSpecError,
-    ScopeMismatchError,
+    RunNotFoundError,
     UnsupportedCollectionTypeError,
 )
 
@@ -76,9 +76,9 @@ def test_wake_completes_run_and_exposes_only_stable_change_query():
 def test_scope_isolation_applies_to_run_queries_and_cancellation():
     engine, _, _, _, _, _ = build_engine([])
     ref = engine.submit_run(request(), context("isolated", "scope-a"))
-    with pytest.raises(ScopeMismatchError):
+    with pytest.raises(RunNotFoundError):
         engine.get_run(ref.run_id, "scope-b")
-    with pytest.raises(ScopeMismatchError):
+    with pytest.raises(RunNotFoundError):
         engine.cancel_run(ref.run_id, context("cancel", "scope-b"))
     assert engine.query_changes(ChangeQuery(), "scope-b").events == ()
 
@@ -165,3 +165,19 @@ def test_completed_upstream_is_not_marked_done_until_all_pages_are_drained():
     engine.wake()
     assert engine.get_run(ref.run_id, "scope-a").status is RunStatus.COMPLETED
     assert engine.get_run(ref.run_id, "scope-a").processed_count == 3
+
+
+def test_wake_abandons_a_conflicted_run_copy_without_marking_it_failed():
+    engine, state_store, _, _, _, _ = build_engine([])
+    ref = engine.submit_run(request(), context("state-conflict"))
+
+    def reject_stale_save(_record):
+        raise RunStateConflictError("Run 状态发生并发冲突")
+
+    state_store.save = reject_stale_save
+
+    work = engine.wake()
+
+    assert work.inspected == 1
+    assert work.failed == 0
+    assert engine.get_run(ref.run_id, "scope-a").status is RunStatus.QUEUED

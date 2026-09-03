@@ -81,3 +81,31 @@ def test_unified_api_maps_rate_limit_to_retryable_error(monkeypatch):
     assert caught.value.retry_after_seconds == 3
     assert caught.value.submission_unknown is False
     assert caught.value.code == "RATE_LIMITED"
+
+
+def test_unified_api_rejects_non_boolean_deleted_field(monkeypatch):
+    def fake_urlopen(req, timeout):
+        return FakeResponse(
+            {
+                "records": [
+                    {
+                        "record_id": "record-1",
+                        "source_type": "test.collection",
+                        "schema_version": "1.0",
+                        "observed_at": "2026-01-01T00:00:00Z",
+                        "payload": {"key": "key", "body": "body"},
+                        "deleted": "false",
+                    }
+                ],
+                "has_more": False,
+                "result_schema_version": "1.0",
+            }
+        )
+
+    monkeypatch.setattr("monitoring_kit.adapters.upstream.unified_api.urlopen", fake_urlopen)
+    gateway = UnifiedApiGateway(UnifiedApiConfig("http://example.test"), gateway_key="api")
+
+    with pytest.raises(UpstreamError, match="deleted") as caught:
+        gateway.read_batch(UpstreamJobRef("api", "job-1"), None)
+
+    assert caught.value.code == "UPSTREAM_PROTOCOL_ERROR"

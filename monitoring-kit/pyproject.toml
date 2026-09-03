@@ -13,6 +13,10 @@ dependencies = []
 test = [
   "pytest>=8.0",
 ]
+relational = [
+  "SQLAlchemy>=2.0,<3.0",
+  "PyMySQL>=1.1,<2.0",
+]
 
 [project.scripts]
 monitoring-kit = "monitoring_kit.cli:main"

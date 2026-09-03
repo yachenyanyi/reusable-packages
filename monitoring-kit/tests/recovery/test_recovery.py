@@ -1,4 +1,3 @@
-from monitoring_kit.collection.engine import RetryPolicy
 from monitoring_kit.contracts import RunStatus
 
 from tests.support import build_engine, context, request
@@ -9,14 +8,14 @@ def test_recovery_requeues_interrupted_run_and_does_not_duplicate_history():
         [{"record_id": "same", "payload": {"key": "key", "body": "body"}}],
     )
     ref = engine.submit_run(request(), context("recover"))
-    record = state_store.get(ref.run_id)
+    record = state_store.get("scope-a", ref.run_id)
     record.status = RunStatus.RUNNING
     record.started_at = clock.now()
     record.next_wakeup_at = clock.now()
     state_store.save(record)
     recovered = engine.recover_interrupted_runs()
     assert recovered.recovered == 1
-    assert state_store.get(ref.run_id).status is RunStatus.QUEUED
+    assert state_store.get("scope-a", ref.run_id).status is RunStatus.QUEUED
     engine.wake()
     assert engine.get_run(ref.run_id, "scope-a").status is RunStatus.COMPLETED
     assert len(sink.events) == 1

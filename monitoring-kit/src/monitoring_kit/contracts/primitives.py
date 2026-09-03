@@ -43,10 +43,13 @@ def parse_datetime(value: str | datetime, field_name: str) -> datetime:
         raise ValueError(f"{field_name} 不是有效的 ISO 时间") from exc
 
 
-def require_text(value: str, field_name: str) -> str:
+def require_text(value: str, field_name: str, *, max_length: int | None = None) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field_name} 必须是非空字符串")
-    return value.strip()
+    value = value.strip()
+    if max_length is not None and len(value) > max_length:
+        raise ValueError(f"{field_name} 长度不能超过 {max_length} 个字符")
+    return value
 
 
 def validate_type_key(value: str, field_name: str = "type_key") -> str:

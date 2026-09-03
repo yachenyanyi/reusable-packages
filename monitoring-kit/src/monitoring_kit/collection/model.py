@@ -80,7 +80,11 @@ class UpstreamJobRequest:
         if self.source_ref is not None:
             object.__setattr__(self, "source_ref", require_text(self.source_ref, "source_ref"))
         if self.gateway_hint is not None:
-            object.__setattr__(self, "gateway_hint", require_text(self.gateway_hint, "gateway_hint"))
+            object.__setattr__(
+                self,
+                "gateway_hint",
+                require_text(self.gateway_hint, "gateway_hint", max_length=255),
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,7 +93,11 @@ class UpstreamJobRef:
     job_id: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "gateway_key", require_text(self.gateway_key, "gateway_key"))
+        object.__setattr__(
+            self,
+            "gateway_key",
+            require_text(self.gateway_key, "gateway_key", max_length=255),
+        )
         object.__setattr__(self, "job_id", require_text(self.job_id, "job_id"))
 
 
@@ -168,6 +176,8 @@ class UpstreamRecord:
             object.__setattr__(self, "external_id", require_text(self.external_id, "external_id"))
         if self.raw_artifact_ref is not None:
             object.__setattr__(self, "raw_artifact_ref", require_text(self.raw_artifact_ref, "raw_artifact_ref"))
+        if not isinstance(self.deleted, bool):
+            raise ValueError("deleted 必须是布尔值")
         if self.sequence is not None and self.sequence < 0:
             raise ValueError("sequence 不能为负数")
 
@@ -208,7 +218,11 @@ class ObservedRecordDraft:
     published_at: datetime | None = None
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "gateway_key", require_text(self.gateway_key, "gateway_key"))
+        object.__setattr__(
+            self,
+            "gateway_key",
+            require_text(self.gateway_key, "gateway_key", max_length=255),
+        )
         object.__setattr__(self, "upstream_record_id", require_text(self.upstream_record_id, "upstream_record_id"))
         object.__setattr__(self, "content_type_key", validate_type_key(self.content_type_key, "content_type_key"))
         object.__setattr__(self, "content_schema_version", validate_schema_version(self.content_schema_version))
@@ -272,6 +286,7 @@ class RunRecord:
     attempts: list[Attempt] = field(default_factory=list)
     processed_ingest_keys: set[tuple[str, str]] = field(default_factory=set)
     record_failures: list[RecordFailure] = field(default_factory=list)
+    state_version: int = field(default=0, repr=False)
 
     @property
     def terminal(self) -> bool:

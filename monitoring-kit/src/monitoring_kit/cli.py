@@ -22,6 +22,8 @@ from .contracts import (
     ChangeQuery,
     ChangeKind,
     ExecutionContext,
+    IngestKey,
+    Observation,
     Presence,
     Provenance,
     RunRequest,
@@ -31,6 +33,7 @@ from .contracts import (
 )
 from .history.history import ContentHistory
 from .history.model import ComparisonContext, RevisionDecision, RevisionMaterial
+from .runtime import DeliveryGuarantee, DeliveryRetryPolicy, DispatchRequest, OutboxDispatcher
 from .runtime.registry import ExtensionRegistry
 
 
@@ -175,13 +178,83 @@ def run_demo() -> int:
     return 0 if summary.status is RunStatus.COMPLETED else 1
 
 
+class _DemoPublisher:
+    def __init__(self) -> None:
+        self.failures = 1
+        self.events = []
+
+    def publish(self, events) -> None:
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("CLI 演示中的临时投递失败")
+        self.events.extend(events)
+
+
+def run_dispatch_demo() -> int:
+    """用内存 Outbox 演示“失败保留、重试后投递”的独立运行方式。"""
+
+    now = datetime.now(UTC)
+    registry = ExtensionRegistry()
+    registry.register_content_policy(_DemoContentPolicy())
+    store = InMemoryHistoryStore(delivery_guarantee=DeliveryGuarantee.AT_LEAST_ONCE)
+    history = ContentHistory(store, registry)
+    result = history.record(
+        Observation(
+            observation_id="cli-demo-observation",
+            scope_key="cli-demo",
+            run_id="cli-demo-run",
+            ingest_key=IngestKey("cli-demo-gateway", "cli-demo-record"),
+            subject=SubjectRef("demo.subject", "item-1", "1.0"),
+            observed_at=now,
+            presence=Presence.PRESENT,
+            content=TypedEnvelope("demo.content", "1.0", {"key": "item-1", "body": "demo"}),
+            provenance=Provenance(source_ref="cli-demo"),
+            received_at=now,
+        )
+    )
+    publisher = _DemoPublisher()
+    dispatcher = OutboxDispatcher(
+        store,
+        publisher,
+        retry_policy=DeliveryRetryPolicy(max_attempts=2, base_delay_seconds=0, max_delay_seconds=0),
+    )
+    first = dispatcher.dispatch_once(DispatchRequest("cli-worker", now))
+    second = dispatcher.dispatch_once(DispatchRequest("cli-worker", now))
+    print(
+        json.dumps(
+            {
+                "event_id": result.events[0].event_id,
+                "first_dispatch": {
+                    "claimed": first.claimed,
+                    "delivered": first.delivered,
+                    "retried": first.retried,
+                    "blocked": first.blocked,
+                },
+                "second_dispatch": {
+                    "claimed": second.claimed,
+                    "delivered": second.delivered,
+                    "retried": second.retried,
+                    "blocked": second.blocked,
+                },
+                "published_event_ids": [event.event_id for event in publisher.events],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0 if second.delivered == 1 else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="monitoring-kit", description="monitoring-kit 核心库验收 CLI")
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("demo", help="运行通用核心闭环演示")
+    subparsers.add_parser("dispatch", help="运行 Outbox 可靠投递演示")
     args = parser.parse_args(argv)
     if args.command == "demo":
         return run_demo()
+    if args.command == "dispatch":
+        return run_dispatch_demo()
     parser.print_help()
     return 2
 

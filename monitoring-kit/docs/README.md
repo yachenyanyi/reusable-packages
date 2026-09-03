@@ -30,6 +30,13 @@ docs/
 12. [公共 API 与扩展 SPI](foundation/09-公共API与扩展SPI.md)
 13. [代码目录与扩展布局](foundation/10-代码目录与扩展布局.md)
 14. [v0.1 核心开发简报](foundation/11-v0.1核心开发简报.md)
+15. [v0.2 关系型持久化适配层开发简报](foundation/12-v0.2关系型持久化适配层开发简报.md)
+16. [假统一采集 API 联调测试计划](foundation/13-假统一采集API联调测试计划.md)
+17. [v0.2 可靠性修复与代码收敛计划](foundation/14-v0.2可靠性修复与代码收敛计划.md)
+18. [v0.3 事务型 Outbox 开发计划](foundation/15-v0.3事务型Outbox开发计划.md)
+19. [scope 隔离契约强化开发计划](foundation/16-scope隔离契约强化开发计划.md)
+20. [运行时公平调度与并发配额开发计划](foundation/17-运行时公平调度与并发配额开发计划.md)
+21. [核心范围与开发总计划](foundation/18-monitoring-kit核心范围与开发总计划.md)
 
 ## 项目档案
 

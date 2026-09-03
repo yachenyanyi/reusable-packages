@@ -9,13 +9,22 @@ from ..contracts.change import (
     ChangeEvent,
     ChangePage,
     ChangeQuery,
-    Document,
     DocumentView,
-    Snapshot,
     SnapshotTimeline,
 )
+from ..contracts.envelope import TypedEnvelope
 from ..contracts.observation import IngestKey, SubjectRef
-from .model import ComparisonContext, HistoryResult, HistoryWrite, RevisionDecision, RevisionMaterial
+from .model import (
+    ComparisonContext,
+    HistoryCommitOutcome,
+    HistoryWrite,
+    RevisionDecision,
+    RevisionMaterial,
+)
+
+
+class HistoryWriteConflictError(Exception):
+    """HistoryWrite 基于的 Document 已过期，或存储检测到暂时并发冲突。"""
 
 
 class HistoryStore(Protocol):
@@ -25,7 +34,7 @@ class HistoryStore(Protocol):
     def get_document(self, scope_key: str, subject: SubjectRef):
         ...
 
-    def commit(self, write: HistoryWrite) -> None:
+    def commit(self, write: HistoryWrite) -> HistoryCommitOutcome:
         ...
 
     def get_current(self, scope_key: str, document_id: str) -> DocumentView | None:

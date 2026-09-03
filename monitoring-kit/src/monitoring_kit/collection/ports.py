@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from datetime import datetime
 from typing import Protocol
 
 from ..contracts.envelope import TypedEnvelope
+from ..runtime.model import AllocationRequest
 from .model import (
     AdapterContext,
     ObservedRecordDraft,
@@ -39,6 +38,10 @@ class UpstreamError(Exception):
         self.retry_after_seconds = retry_after_seconds
         self.fallback_allowed = fallback_allowed
         self.submission_unknown = submission_unknown
+
+
+class RunStateConflictError(Exception):
+    """Run 的本地副本已过期，调用方必须放弃该副本。"""
 
 
 class UpstreamJobGateway(Protocol):
@@ -86,13 +89,13 @@ class RunStateStore(Protocol):
     def create(self, record) -> None:
         ...
 
-    def get(self, run_id: str):
+    def get(self, scope_key: str, run_id: str):
         ...
 
     def save(self, record) -> None:
         ...
 
-    def claim_runnable(self, now: datetime, limit: int, lease_owner: str, lease_seconds: float):
+    def allocate(self, request: AllocationRequest):
         ...
 
     def list_incomplete(self):

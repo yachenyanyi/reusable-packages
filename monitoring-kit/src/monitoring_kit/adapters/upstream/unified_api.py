@@ -43,7 +43,7 @@ class UnifiedApiGateway(UpstreamJobGateway):
 
     def __init__(self, config: UnifiedApiConfig, *, gateway_key: str = "unified-api") -> None:
         self.config = config
-        self.gateway_key = require_text(gateway_key, "gateway_key")
+        self.gateway_key = require_text(gateway_key, "gateway_key", max_length=255)
 
     def submit(self, request: UpstreamJobRequest, idempotency_key: str) -> UpstreamJobRef:
         body = {

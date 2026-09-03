@@ -52,6 +52,7 @@ Run → Observation → Document → Snapshot → ChangeEvent
 - [15-站点监测.md](15-站点监测.md)
 - [16-GEO效果监测.md](16-GEO效果监测.md)
 - [17-舆情监控.md](17-舆情监控.md)
+- [18-关系型持久化适配层.md](18-关系型持久化适配层.md)
 
 ## 依赖原则
 

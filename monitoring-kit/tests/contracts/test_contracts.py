@@ -34,6 +34,7 @@ def test_run_request_and_context_validate_time_and_identity_fields():
         requested_window=RequestedWindow(now, now + timedelta(hours=1)),
     )
     assert request.fingerprint() == request.fingerprint()
+    assert request.fingerprint() == "1d7aefd8f2e17b505829d8a57bbf96739ef4020b508edda0135565ec80d80dd1"
     assert RunRequest.from_dict(request.to_dict()) == request
     assert ExecutionContext("scope", "actor", "idem").scope_key == "scope"
     with pytest.raises(ValueError):

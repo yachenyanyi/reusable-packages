@@ -63,7 +63,11 @@ class TestCollectionAdapter:
         return ValidationResult.ok()
 
     def build_upstream_request(self, spec: TypedEnvelope, context: AdapterContext) -> UpstreamJobRequest:
-        return UpstreamJobRequest(collection=spec, source_ref=context.source_ref)
+        return UpstreamJobRequest(
+            collection=spec,
+            source_ref=context.source_ref,
+            gateway_hint=spec.data.get("gateway_hint"),
+        )
 
     def map_record(self, record: UpstreamRecord, context: AdapterContext) -> ObservedRecordDraft:
         payload = dict(record.payload)
@@ -264,12 +268,15 @@ def build_engine(
     return engine, state_store, history_store, event_sink, gateway, clock
 
 
-def request(name: str = "one") -> RunRequest:
+def request(name: str = "one", *, gateway_hint: str | None = None) -> RunRequest:
+    data = {"records": [name]}
+    if gateway_hint is not None:
+        data["gateway_hint"] = gateway_hint
     return RunRequest(
         collection=TypedEnvelope(
             "test.collection",
             "1.0",
-            {"records": [name]},
+            data,
         ),
         source_ref="test-source",
     )

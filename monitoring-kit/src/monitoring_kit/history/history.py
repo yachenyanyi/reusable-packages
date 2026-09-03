@@ -16,10 +16,14 @@ from ..contracts.change import (
 )
 from ..contracts.observation import Observation, Presence
 from ..contracts.primitives import new_id, stable_json, utc_now
-from ..errors import HistoryInvariantError, IdempotencyConflictError
+from ..errors import ConfigurationError, HistoryInvariantError, IdempotencyConflictError
+from ..runtime.model import DeliveryGuarantee
 from ..runtime.registry import ExtensionRegistry
-from .model import ComparisonContext, HistoryResult, HistoryWrite
-from .ports import EventSink, HistoryStore
+from .model import ComparisonContext, HistoryCommitOutcome, HistoryResult, HistoryWrite
+from .ports import EventSink, HistoryStore, HistoryWriteConflictError
+
+
+_MAX_CONCURRENT_RETRIES = 3
 
 
 class ContentHistory:
@@ -37,6 +41,12 @@ class ContentHistory:
         event_sink: EventSink | None = None,
         clock: Any | None = None,
     ) -> None:
+        if (
+            event_sink is not None
+            and getattr(store, "delivery_guarantee", DeliveryGuarantee.NONE)
+            is DeliveryGuarantee.AT_LEAST_ONCE
+        ):
+            raise ConfigurationError("启用至少一次事件投递时不能同时配置提交后直发 EventSink")
         self._store = store
         self._registry = registry
         self._event_sink = event_sink
@@ -48,6 +58,16 @@ class ContentHistory:
             return self._record(observation)
 
     def _record(self, observation: Observation) -> HistoryResult:
+        for attempt in range(_MAX_CONCURRENT_RETRIES):
+            try:
+                return self._record_once(observation)
+            except HistoryWriteConflictError:
+                if attempt == _MAX_CONCURRENT_RETRIES - 1:
+                    raise
+
+        raise AssertionError("History 并发重试循环未返回")
+
+    def _record_once(self, observation: Observation) -> HistoryResult:
         stored = self._store.get_by_ingest_key(observation.scope_key, observation.ingest_key)
         fingerprint = _observation_fingerprint(observation)
         if stored is not None:
@@ -198,13 +218,21 @@ class ContentHistory:
             snapshot=snapshot,
             events=events,
         )
-        self._store.commit(
+        outcome = self._store.commit(
             HistoryWrite(
                 ingest_key=(observation.ingest_key.gateway_key, observation.ingest_key.upstream_record_id),
                 observation_fingerprint=fingerprint,
                 result=result,
+                base_document=existing_document,
             )
         )
+        if outcome is HistoryCommitOutcome.DUPLICATE:
+            stored = self._store.get_by_ingest_key(observation.scope_key, observation.ingest_key)
+            if stored is None or stored.fingerprint != fingerprint:
+                raise HistoryInvariantError("历史提交报告重复，但无法读取已提交结果")
+            return replace(stored.result, duplicate=True)
+        if outcome is not HistoryCommitOutcome.CREATED:
+            raise HistoryInvariantError("HistoryStore.commit 返回了未知结果")
         if events and self._event_sink is not None:
             # 事实已经在 HistoryStore 中提交。投递失败不能让上层重做历史写入；
             # 具备可靠投递需求时由 EventSink 自身实现 outbox/重投。

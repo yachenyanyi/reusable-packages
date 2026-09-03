@@ -1,6 +1,5 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
-from monitoring_kit.collection.model import ObservedRecordDraft
 from monitoring_kit.contracts import (
     ChangeKind,
     Document,
@@ -56,7 +55,7 @@ def test_missing_confirmation_and_restore_are_policy_decisions():
     )
     from tests.support import context, request
 
-    ref = engine.submit_run(request(), context("missing-run"))
+    engine.submit_run(request(), context("missing-run"))
     engine.wake()
     from monitoring_kit.contracts import ChangeQuery
 

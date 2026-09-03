@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from datetime import datetime
+from collections.abc import Mapping
 from enum import Enum
+from types import MappingProxyType
 from typing import Any
 
 from .envelope import TypedEnvelope
@@ -77,6 +80,56 @@ class ExecutionLimits:
 
 
 @dataclass(frozen=True, slots=True)
+class RuntimePolicy:
+    """宿主计算出的通用运行约束快照。
+
+    该对象只表达运行时事实，不解释限制来自哪个用户、套餐或合同。
+    策略随 Run 保存，确保排队期间配置变化不会让一个 Run 的语义漂移。
+    """
+
+    max_concurrent_runs: int | None = None
+    scheduling_priority: int = 0
+    gateway_limits: Mapping[str, int] = field(default_factory=dict)
+    policy_version: str = "default"
+
+    def __post_init__(self) -> None:
+        if self.max_concurrent_runs is not None:
+            if isinstance(self.max_concurrent_runs, bool) or not isinstance(self.max_concurrent_runs, int):
+                raise ValueError("max_concurrent_runs 必须是整数或 None")
+            if self.max_concurrent_runs < 1:
+                raise ValueError("max_concurrent_runs 必须大于 0")
+        if isinstance(self.scheduling_priority, bool) or not isinstance(self.scheduling_priority, int):
+            raise ValueError("scheduling_priority 必须是整数")
+        if not isinstance(self.gateway_limits, Mapping):
+            raise ValueError("gateway_limits 必须是对象")
+        normalized: dict[str, int] = {}
+        for gateway_key, limit in self.gateway_limits.items():
+            gateway_key = require_text(gateway_key, "gateway_limits.gateway_key")
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+                raise ValueError("gateway_limits 的值必须是大于 0 的整数")
+            normalized[gateway_key] = limit
+        object.__setattr__(self, "gateway_limits", MappingProxyType(normalized))
+        object.__setattr__(self, "policy_version", require_text(self.policy_version, "policy_version"))
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "max_concurrent_runs": self.max_concurrent_runs,
+            "scheduling_priority": self.scheduling_priority,
+            "gateway_limits": dict(self.gateway_limits),
+            "policy_version": self.policy_version,
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict[str, Any]) -> "RuntimePolicy":
+        return cls(
+            max_concurrent_runs=value.get("max_concurrent_runs"),
+            scheduling_priority=value.get("scheduling_priority", 0),
+            gateway_limits=value.get("gateway_limits", {}),
+            policy_version=value.get("policy_version", "default"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class RunRequest:
     collection: TypedEnvelope
     source_ref: str | None = None
@@ -102,7 +155,9 @@ class RunRequest:
         }
 
     def fingerprint(self) -> str:
-        return stable_json(self.to_dict())
+        """返回可安全放入索引列的稳定请求摘要。"""
+
+        return hashlib.sha256(stable_json(self.to_dict()).encode("utf-8")).hexdigest()
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "RunRequest":
@@ -123,6 +178,7 @@ class ExecutionContext:
     idempotency_key: str
     limits: ExecutionLimits | None = None
     trace_ref: str | None = None
+    runtime_policy: RuntimePolicy | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("scope_key", "actor_ref", "idempotency_key"):
@@ -131,6 +187,8 @@ class ExecutionContext:
             object.__setattr__(self, "trace_ref", require_text(self.trace_ref, "trace_ref"))
         if self.limits is not None and not isinstance(self.limits, ExecutionLimits):
             raise ValueError("limits 必须是 ExecutionLimits")
+        if self.runtime_policy is not None and not isinstance(self.runtime_policy, RuntimePolicy):
+            raise ValueError("runtime_policy 必须是 RuntimePolicy")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -139,17 +197,20 @@ class ExecutionContext:
             "idempotency_key": self.idempotency_key,
             "limits": self.limits.to_dict() if self.limits else None,
             "trace_ref": self.trace_ref,
+            "runtime_policy": self.runtime_policy.to_dict() if self.runtime_policy else None,
         }
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> "ExecutionContext":
         limits = value.get("limits")
+        runtime_policy = value.get("runtime_policy")
         return cls(
             scope_key=value["scope_key"],
             actor_ref=value["actor_ref"],
             idempotency_key=value["idempotency_key"],
             limits=ExecutionLimits.from_dict(limits) if limits else None,
             trace_ref=value.get("trace_ref"),
+            runtime_policy=RuntimePolicy.from_dict(runtime_policy) if runtime_policy else None,
         )
 
 
