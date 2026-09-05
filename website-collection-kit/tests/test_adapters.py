@@ -91,7 +91,7 @@ async def test_httpx_adapter_performs_real_local_collection(local_site: str) -> 
             "http-local",
             "local-site",
             CollectionIntent.SITE_SWEEP,
-            Scope.for_seeds([local_site + "/"]),
+            Scope.for_seeds([local_site + "/"], allow_private_network=True),
             seeds=(local_site + "/",),
             budget=Budget(
                 max_pages=10, max_candidates=20, max_depth=3, max_duration_seconds=10
@@ -111,8 +111,11 @@ async def test_httpx_adapter_performs_real_local_collection(local_site: str) -> 
 @pytest.mark.asyncio
 async def test_playwright_adapter_renders_local_page(local_site: str) -> None:
     acquisition = PlaywrightAcquisition(timeout_seconds=10)
+    scope = Scope.for_seeds([local_site + "/"], allow_private_network=True)
     try:
-        response = await acquisition.fetch(FetchRequest(local_site + "/home"))
+        response = await acquisition.fetch(
+            FetchRequest(local_site + "/home", scope=scope)
+        )
     except Exception as exc:
         await acquisition.close()
         message = str(exc).lower()
@@ -137,8 +140,11 @@ async def test_playwright_adapter_waits_for_delayed_dom_content(
     local_site: str,
 ) -> None:
     acquisition = PlaywrightAcquisition(timeout_seconds=10, settle_timeout_seconds=1)
+    scope = Scope.for_seeds([local_site + "/"], allow_private_network=True)
     try:
-        response = await acquisition.fetch(FetchRequest(local_site + "/dynamic"))
+        response = await acquisition.fetch(
+            FetchRequest(local_site + "/dynamic", scope=scope)
+        )
     except Exception as exc:
         await acquisition.close()
         message = str(exc).lower()

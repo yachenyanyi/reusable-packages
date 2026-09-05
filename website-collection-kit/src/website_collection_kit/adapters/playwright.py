@@ -7,6 +7,7 @@ import time
 
 from ..contracts import RenderingRequirement, Scope
 from ..errors import AcquisitionError, NoAcquisitionCapabilityError
+from ..network import PublicNetworkPolicy
 from ..ports import AcquisitionPort, FetchRequest, FetchResponse
 from ..url_policy import UrlPolicy
 
@@ -28,6 +29,7 @@ class PlaywrightAcquisition:
         settle_timeout_seconds: float = 2.0,
         max_response_bytes: int = 8_000_000,
         user_agent: str = "website-collection-kit/0.1",
+        network_policy: PublicNetworkPolicy | None = None,
     ) -> None:
         if browser_name not in {"chromium", "firefox", "webkit"}:
             raise ValueError("browser_name must be chromium, firefox, or webkit")
@@ -46,6 +48,7 @@ class PlaywrightAcquisition:
         self.settle_timeout_ms = max(0, int(settle_timeout_seconds * 1000))
         self.max_response_bytes = max_response_bytes
         self.user_agent = user_agent
+        self.network_policy = network_policy or PublicNetworkPolicy()
         self._playwright = None
         self._browser = None
         self._browser_lock = asyncio.Lock()
@@ -79,6 +82,20 @@ class PlaywrightAcquisition:
             return browser
 
     async def fetch(self, request: FetchRequest) -> FetchResponse:
+        private_network = bool(
+            request.scope and request.scope.allow_private_network
+        )
+        network_decision = await self.network_policy.check_url(
+            request.url,
+            method="GET",
+            allow_private_network=private_network,
+        )
+        if not network_decision.accepted:
+            raise AcquisitionError(
+                "network_policy_denied",
+                f"network policy denied {request.url}: {network_decision.reason}",
+                retryable=network_decision.reason == "dns_resolution_failed",
+            )
         browser = await self._ensure_browser()
         started = time.perf_counter()
         context = None
@@ -86,29 +103,82 @@ class PlaywrightAcquisition:
         try:
             scope = request.scope or Scope.for_seeds([request.url])
             policy = UrlPolicy(scope)
-            context = await browser.new_context(user_agent=self.user_agent)
+            context = await browser.new_context(
+                user_agent=self.user_agent,
+                service_workers="block",
+            )
             page = await context.new_page()
 
             async def guard_route(route, browser_request) -> None:
                 nonlocal blocked_navigation_url
                 is_navigation = browser_request.is_navigation_request()
-                decision = (
-                    policy.decide(browser_request.url)
-                    if is_navigation
-                    else policy.decide_auxiliary(browser_request.url)
+                method_decision = self.network_policy.decide_method(
+                    browser_request.method
                 )
-                if decision.accepted:
-                    await route.continue_()
+                if not method_decision.accepted:
+                    await route.abort()
+                    return
+                if browser_request.resource_type == "websocket":
+                    await route.abort()
+                    return
+                network_decision = await self.network_policy.check_url(
+                    browser_request.url,
+                    method=browser_request.method,
+                    allow_private_network=private_network,
+                )
+                if not network_decision.accepted:
+                    if is_navigation:
+                        blocked_navigation_url = browser_request.url
+                    await route.abort()
                     return
                 if is_navigation:
-                    blocked_navigation_url = browser_request.url
-                await route.abort()
+                    decision = policy.decide(browser_request.url)
+                    if not decision.accepted:
+                        blocked_navigation_url = browser_request.url
+                        await route.abort()
+                        return
+                await route.continue_()
 
             # Browser navigation follows redirects internally.  Intercepting
             # requests here is what makes the core's Scope meaningful for CDP
             # runs as well as for the no-redirect HTTP adapter.  Subresources
             # may use another path on an allowed host, but never another host.
-            await page.route("**/*", guard_route)
+            await context.route("**/*", guard_route)
+
+            async def cancel_download(download) -> None:
+                try:
+                    await download.cancel()
+                except Exception:
+                    return
+
+            def watch_downloads(watched_page) -> None:
+                watched_page.on(
+                    "download",
+                    lambda download: asyncio.create_task(cancel_download(download)),
+                )
+
+            async def close_popup(popup_page) -> None:
+                try:
+                    await popup_page.close()
+                except Exception:
+                    return
+
+            watch_downloads(page)
+            # Context-level routing covers popup requests, while closing every
+            # page created after the primary page prevents a popup from
+            # becoming a second uncontrolled browsing session.  The handler is
+            # intentionally best-effort because the context may close first.
+            def handle_new_page(new_page) -> None:
+                watch_downloads(new_page)
+                asyncio.create_task(close_popup(new_page))
+
+            context.on("page", handle_new_page)
+            route_web_socket = getattr(page, "route_web_socket", None)
+            if route_web_socket is not None:
+                async def guard_websocket(websocket_route) -> None:
+                    await websocket_route.close()
+
+                await route_web_socket("**/*", guard_websocket)
             response = await page.goto(
                 request.url, wait_until="domcontentloaded", timeout=self.timeout_ms
             )

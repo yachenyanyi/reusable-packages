@@ -46,6 +46,11 @@ from .errors import (
 from .evidence import MemoryEvidenceStore
 from .interpretation import HtmlInterpreter
 from .ports import AcquisitionPort, EvidencePayload, FetchRequest, FetchResponse
+from .robots import (
+    DEFAULT_PRODUCT_TOKEN,
+    RobotsRules,
+    parse_robots as _parse_robots,
+)
 from .url_policy import UrlPolicy
 
 
@@ -83,6 +88,14 @@ _COMMON_SITEMAP_PATHS = (
     "/sitemap.xml.gz",
     "/sitemap_index.xml.gz",
 )
+_BUDGET_FAILURE_CODES = frozenset(
+    {
+        "request_budget_exhausted",
+        "byte_budget_exhausted",
+        "rendered_page_budget_exhausted",
+        "operation_deadline_exceeded",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -91,6 +104,7 @@ class _FrontierItem:
     canonical_url: str
     depth: int
     sources: tuple[str, ...]
+    request_aliases: tuple[str, ...] = ()
     priority: int = 1
 
 
@@ -129,12 +143,19 @@ class _Frontier:
         if decision.canonical_url in self._known:
             previous = self._known[decision.canonical_url]
             sources = tuple(dict.fromkeys(previous.sources + (source,)))
+            aliases = tuple(
+                dict.fromkeys(
+                    previous.request_aliases
+                    + ((decision.request_url,) if decision.request_url != previous.url else ())
+                )
+            )
             priority = min(previous.priority, _frontier_priority(source, raw_url))
             updated = _FrontierItem(
                 previous.url,
                 previous.canonical_url,
                 min(previous.depth, depth),
                 sources,
+                aliases,
                 priority,
             )
             self._known[decision.canonical_url] = updated
@@ -151,6 +172,7 @@ class _Frontier:
                         candidate,
                         depth=min(candidate.depth, depth),
                         discovery_sources=sources,
+                        request_aliases=aliases,
                     )
                     break
             self.duplicate_count += 1
@@ -166,7 +188,7 @@ class _Frontier:
             )
             return False
         item = _FrontierItem(
-            url=decision.canonical_url,
+            url=decision.request_url,
             canonical_url=decision.canonical_url,
             depth=depth,
             sources=(source,),
@@ -181,6 +203,7 @@ class _Frontier:
                 canonical_url=item.canonical_url,
                 depth=depth,
                 discovery_sources=(source,),
+                request_aliases=(),
             )
         )
         return True
@@ -210,6 +233,7 @@ class _Frontier:
                 item.canonical_url,
                 item.depth,
                 tuple(dict.fromkeys(item.sources + (source,))),
+                item.request_aliases,
                 item.priority,
             )
 
@@ -232,71 +256,6 @@ class _BatchGate:
             self._turns[index + 1].set()
 
         return release
-
-
-class _RobotsRules:
-    def __init__(
-        self,
-        disallow: Iterable[str] = (),
-        allow: Iterable[str] = (),
-        sitemaps: Iterable[str] = (),
-    ) -> None:
-        self.disallow = tuple(path for path in disallow if path)
-        self.allow = tuple(path for path in allow if path)
-        self.sitemaps = tuple(dict.fromkeys(sitemaps))
-
-    def allows(self, url: str) -> bool:
-        path = urlsplit(url).path or "/"
-        query = urlsplit(url).query
-        if query:
-            path += "?" + query
-        matches = [
-            (len(rule), False)
-            for rule in self.disallow
-            if _robots_rule_matches(rule, path)
-        ]
-        matches.extend(
-            (len(rule), True) for rule in self.allow if _robots_rule_matches(rule, path)
-        )
-        if not matches:
-            return True
-        _, allowed = max(matches, key=lambda value: (value[0], value[1]))
-        return allowed
-
-
-def _parse_robots(body: bytes) -> _RobotsRules:
-    text = body.decode("utf-8", errors="replace")
-    active = False
-    saw_agent = False
-    disallow: list[str] = []
-    allow: list[str] = []
-    sitemaps: list[str] = []
-    for raw_line in text.splitlines():
-        line = raw_line.split("#", 1)[0].strip()
-        if not line or ":" not in line:
-            continue
-        key, value = line.split(":", 1)
-        key, value = key.strip().lower(), value.strip()
-        if key == "user-agent":
-            active = value == "*"
-            saw_agent = saw_agent or active
-        elif key == "disallow" and active:
-            disallow.append(value)
-        elif key == "allow" and active:
-            allow.append(value)
-        elif key == "sitemap" and value:
-            sitemaps.append(value)
-    if not saw_agent:
-        disallow, allow = [], []
-    return _RobotsRules(disallow, allow, sitemaps)
-
-
-def _robots_rule_matches(rule: str, path: str) -> bool:
-    end_anchored = rule.endswith("$")
-    expression = rule[:-1] if end_anchored else rule
-    expression = re.escape(expression).replace(r"\*", ".*")
-    suffix = "$" if end_anchored else ""
-    return re.match(r"^" + expression + suffix, path) is not None
 
 
 def _discovery_unsafe_reason(raw_url: str, base_url: str) -> str | None:
@@ -396,9 +355,13 @@ class _RunState:
     succeeded_sources: list[str]
     limits_reached: set[str]
     blind_spots: set[str]
-    robots: dict[str, _RobotsRules]
+    robots: dict[str, RobotsRules]
     redirect_hops: dict[str, int]
     auxiliary_seen: set[tuple[str, str]]
+    failed_pages: set[str]
+    request_limit: int
+    total_bytes_limit: int
+    rendered_page_limit: int | None
     requests: int = 0
     rendered_pages: int = 0
     bytes_received: int = 0
@@ -593,6 +556,10 @@ class WebsiteCollectionKit:
             robots={},
             redirect_hops={},
             auxiliary_seen=set(),
+            failed_pages=set(),
+            request_limit=budget.max_requests,
+            total_bytes_limit=budget.max_total_bytes,
+            rendered_page_limit=budget.max_rendered_pages,
         )
         policy = UrlPolicy(scope)
         frontier = _Frontier(policy, budget.max_candidates)
@@ -646,6 +613,8 @@ class WebsiteCollectionKit:
                     include_sitemaps=False,
                 )
             while frontier.has_pending():
+                if state.stop_reason is StopReason.BUDGET_EXHAUSTED:
+                    break
                 if asyncio.get_running_loop().time() >= deadline:
                     state.limits_reached.add("max_duration_seconds")
                     state.stop_reason = StopReason.BUDGET_EXHAUSTED
@@ -658,13 +627,12 @@ class WebsiteCollectionKit:
                 while (
                     frontier.has_pending()
                     and len(batch) < self.max_parallel_fetches
-                    and len(state.visited) < budget.max_pages
+                    and len(state.visited) + len(batch) < budget.max_pages
                 ):
                     item = frontier.pop()
                     if item.canonical_url in state.visited:
                         frontier.duplicate_count += 1
                         continue
-                    state.visited.add(item.canonical_url)
                     if item.depth > budget.max_depth:
                         state.limits_reached.add("max_depth")
                         state.stop_reason = StopReason.BUDGET_EXHAUSTED
@@ -678,8 +646,12 @@ class WebsiteCollectionKit:
                         state.exclusions.append(
                             Exclusion(item.url, "robots_disallowed", "robots")
                         )
+                        if state.stop_reason is StopReason.BUDGET_EXHAUSTED:
+                            break
                         continue
                     batch.append(item)
+                    if state.stop_reason is StopReason.BUDGET_EXHAUSTED:
+                        break
                 if batch:
                     remaining = max(0.001, deadline - asyncio.get_running_loop().time())
                     try:
@@ -762,14 +734,19 @@ class WebsiteCollectionKit:
                 state.limits_reached.add("max_duration_seconds")
                 state.stop_reason = StopReason.BUDGET_EXHAUSTED
                 return
-            rules = await self._load_robots(state, policy, origin, deadline)
+            rules = (
+                await self._load_robots(state, policy, origin, deadline)
+                if policy.scope.respect_robots
+                else RobotsRules.unavailable()
+            )
+            if state.stop_reason is StopReason.BUDGET_EXHAUSTED:
+                return
             if include_sitemaps:
                 configured = tuple(rules.sitemaps)
                 conventional = tuple(
                     origin.rstrip("/") + path for path in _COMMON_SITEMAP_PATHS
                 )
-                sitemaps = tuple(dict.fromkeys(configured + conventional))
-                for sitemap in sitemaps:
+                for sitemap in configured:
                     await self._read_sitemap(
                         state,
                         frontier,
@@ -777,8 +754,22 @@ class WebsiteCollectionKit:
                         sitemap,
                         deadline,
                         depth=0,
-                        optional=not rules.sitemaps,
+                        optional=False,
                     )
+                    if state.stop_reason is StopReason.BUDGET_EXHAUSTED:
+                        return
+                for sitemap in conventional:
+                    await self._read_sitemap(
+                        state,
+                        frontier,
+                        policy,
+                        sitemap,
+                        deadline,
+                        depth=0,
+                        optional=True,
+                    )
+                    if state.stop_reason is StopReason.BUDGET_EXHAUSTED:
+                        return
         if not include_sitemaps:
             return
         hints = tuple(profile.discovery_hints if profile else ())
@@ -802,6 +793,8 @@ class WebsiteCollectionKit:
                     await self._read_sitemap(
                         state, frontier, policy, hint_url, deadline, depth=0
                     )
+                if state.stop_reason is StopReason.BUDGET_EXHAUSTED:
+                    return
 
     async def _read_sitemap(
         self,
@@ -836,8 +829,21 @@ class WebsiteCollectionKit:
         response = await self._fetch_auxiliary(
             state, url, policy, purpose="sitemap", deadline=deadline
         )
+        if state.stop_reason is StopReason.BUDGET_EXHAUSTED:
+            return
         if not response or response.status < 200 or response.status >= 300:
-            state.blind_spots.add("sitemap_unavailable")
+            if optional:
+                state.blind_spots.add("sitemap_unavailable")
+            else:
+                state.issues.append(
+                    PageIssue(
+                        "sitemap_unavailable",
+                        url,
+                        "discovery",
+                        "declared sitemap could not be fetched",
+                        retryable=True,
+                    )
+                )
             return
         try:
             root = ElementTree.fromstring(_decompress_sitemap(response.body))
@@ -872,14 +878,20 @@ class WebsiteCollectionKit:
         ]
         if name == "sitemapindex":
             for child in locations:
-                if frontier.candidate_limit_hit:
+                if (
+                    frontier.candidate_limit_hit
+                    or state.stop_reason is StopReason.BUDGET_EXHAUSTED
+                ):
                     break
                 await self._read_sitemap(
                     state, frontier, policy, child, deadline, depth=depth + 1
                 )
         else:
             for candidate in locations:
-                if frontier.candidate_limit_hit:
+                if (
+                    frontier.candidate_limit_hit
+                    or state.stop_reason is StopReason.BUDGET_EXHAUSTED
+                ):
                     break
                 frontier.add(
                     candidate,
@@ -912,6 +924,8 @@ class WebsiteCollectionKit:
         response = await self._fetch_auxiliary(
             state, url, policy, purpose="feed", deadline=deadline
         )
+        if state.stop_reason is StopReason.BUDGET_EXHAUSTED:
+            return
         if not response or response.status < 200 or response.status >= 300:
             state.blind_spots.add("feed_unavailable")
             return
@@ -929,6 +943,11 @@ class WebsiteCollectionKit:
             return
         state.succeed_source(DiscoverySource.RSS.value)
         for element in root.iter():
+            if (
+                frontier.candidate_limit_hit
+                or state.stop_reason is StopReason.BUDGET_EXHAUSTED
+            ):
+                break
             if _local_name(element.tag) != "link":
                 continue
             value = (element.text or "").strip() or element.attrib.get(
@@ -957,7 +976,7 @@ class WebsiteCollectionKit:
         if not decision.accepted:
             state.exclusions.append(Exclusion(url, decision.reason, purpose))
             return None
-        current = decision.canonical_url
+        current = decision.request_url
         for _ in range(self.max_redirects + 1):
             if asyncio.get_running_loop().time() >= deadline:
                 state.limits_reached.add("max_duration_seconds")
@@ -973,6 +992,13 @@ class WebsiteCollectionKit:
                 state.issues.append(
                     PageIssue(exc.code, current, purpose, str(exc), exc.retryable)
                 )
+                if exc.code in {
+                    "request_budget_exhausted",
+                    "byte_budget_exhausted",
+                    "rendered_page_budget_exhausted",
+                    "operation_deadline_exceeded",
+                }:
+                    state.stop_reason = StopReason.BUDGET_EXHAUSTED
                 return None
             if response.redirect_to:
                 next_decision = policy.decide_auxiliary(
@@ -987,7 +1013,7 @@ class WebsiteCollectionKit:
                         )
                     )
                     return None
-                current = next_decision.canonical_url
+                current = next_decision.request_url
                 continue
             final_decision = policy.decide_auxiliary(response.final_url or current)
             if not final_decision.accepted:
@@ -1012,17 +1038,18 @@ class WebsiteCollectionKit:
         policy: UrlPolicy,
         origin: str,
         deadline: float,
-    ) -> _RobotsRules:
+    ) -> RobotsRules:
         key = _origin_key(origin)
         if not key:
-            return _RobotsRules()
+            return RobotsRules.unreachable()
         cached = state.robots.get(key)
         if cached is not None:
             return cached
         if asyncio.get_running_loop().time() >= deadline:
             state.limits_reached.add("max_duration_seconds")
             state.stop_reason = StopReason.BUDGET_EXHAUSTED
-            rules = _RobotsRules()
+            rules = RobotsRules.unreachable()
+            state.blind_spots.add("robots_unreachable")
             state.robots[key] = rules
             return rules
 
@@ -1031,12 +1058,27 @@ class WebsiteCollectionKit:
         response = await self._fetch_auxiliary(
             state, robots_url, policy, purpose="robots", deadline=deadline
         )
-        rules = _RobotsRules()
+        rules = RobotsRules.unreachable()
         if response and response.status == 200:
-            rules = _parse_robots(response.body)
+            rules = _parse_robots(
+                response.body,
+                product_token=DEFAULT_PRODUCT_TOKEN,
+            )
             state.succeed_source(DiscoverySource.ROBOTS.value)
-        else:
+        elif response and 400 <= response.status < 500:
+            rules = RobotsRules.unavailable()
             state.blind_spots.add("robots_unavailable")
+        else:
+            state.blind_spots.add("robots_unreachable")
+            state.issues.append(
+                PageIssue(
+                    "robots_unreachable",
+                    robots_url,
+                    "discovery",
+                    "robots.txt could not be reached safely; pages are disallowed",
+                    retryable=True,
+                )
+            )
         state.robots[key] = rules
         return rules
 
@@ -1057,11 +1099,18 @@ class WebsiteCollectionKit:
         rendering = _rendering_for(profile)
         try:
             response = await self._fetch_page(
-                state, item.url, rendering, deadline, policy.scope
+                state,
+                item.url,
+                rendering,
+                deadline,
+                policy.scope,
+                page_key=item.canonical_url,
             )
         except AcquisitionError as exc:
             if gate is not None:
                 await gate.wait(batch_index)
+            if exc.code not in _BUDGET_FAILURE_CODES:
+                state.failed_pages.add(item.canonical_url)
             state.issues.append(
                 PageIssue(exc.code, item.url, "fetch", str(exc), exc.retryable)
             )
@@ -1078,6 +1127,7 @@ class WebsiteCollectionKit:
             state.attempt_source(DiscoverySource.REDIRECT.value)
             redirect_hops = state.redirect_hops.get(item.canonical_url, 0) + 1
             if redirect_hops > self.max_redirects:
+                state.failed_pages.add(item.canonical_url)
                 state.issues.append(
                     PageIssue(
                         "too_many_redirects",
@@ -1094,8 +1144,8 @@ class WebsiteCollectionKit:
                 state.succeed_source(DiscoverySource.REDIRECT.value)
                 state.redirect_hops[decision.canonical_url] = redirect_hops
                 frontier.add(
-                    decision.canonical_url,
-                    base_url=None,
+                    response.redirect_to,
+                    base_url=response.final_url or item.url,
                     depth=item.depth,
                     source=DiscoverySource.REDIRECT.value,
                     candidates=state.candidates,
@@ -1117,6 +1167,7 @@ class WebsiteCollectionKit:
             )
             return
         if response.status < 200 or response.status >= 300:
+            state.failed_pages.add(item.canonical_url)
             state.issues.append(
                 PageIssue(
                     "http_status",
@@ -1127,9 +1178,6 @@ class WebsiteCollectionKit:
                 )
             )
             return
-        if "playwright" in response.fetch_method:
-            state.rendered_pages += 1
-        state.bytes_received += len(response.body)
         evidence_refs = ()
         if response.body:
             try:
@@ -1160,8 +1208,8 @@ class WebsiteCollectionKit:
                     decision = policy.decide(value, response.final_url)
                     if decision.accepted:
                         frontier.add(
-                            decision.canonical_url,
-                            base_url=None,
+                            value,
+                            base_url=response.final_url,
                             depth=item.depth + 1,
                             source=DiscoverySource.DATA_URL.value,
                             candidates=state.candidates,
@@ -1189,6 +1237,7 @@ class WebsiteCollectionKit:
                 response, profile=profile, policy=policy
             )
         except Exception as exc:  # noqa: BLE001 - a custom interpreter must fail only this page
+            state.failed_pages.add(item.canonical_url)
             state.issues.append(
                 PageIssue(
                     "interpretation_failed",
@@ -1305,8 +1354,8 @@ class WebsiteCollectionKit:
                     )
                     continue
                 frontier.add(
-                    decision.canonical_url,
-                    base_url=None,
+                    link.raw_url,
+                    base_url=response.final_url,
                     depth=item.depth + 1,
                     source=link.source,
                     candidates=state.candidates,
@@ -1356,6 +1405,7 @@ class WebsiteCollectionKit:
             discovery_sources=item.sources,
             outbound_sources=tuple(dict.fromkeys(outbound)),
             attachments=attachments,
+            request_aliases=item.request_aliases,
         )
         _update_candidate(
             state.candidates,
@@ -1367,7 +1417,14 @@ class WebsiteCollectionKit:
         state.page_keys.add(canonical)
 
     async def _fetch_page(
-        self, state: _RunState, url: str, rendering, deadline: float, scope
+        self,
+        state: _RunState,
+        url: str,
+        rendering,
+        deadline: float,
+        scope,
+        *,
+        page_key: str,
     ) -> FetchResponse | None:
         if asyncio.get_running_loop().time() >= deadline:
             state.limits_reached.add("max_duration_seconds")
@@ -1377,6 +1434,7 @@ class WebsiteCollectionKit:
             state,
             FetchRequest(url, rendering=rendering, purpose="page", scope=scope),
             deadline=deadline,
+            page_key=page_key,
         )
 
     async def _fetch_with_retry(
@@ -1385,6 +1443,7 @@ class WebsiteCollectionKit:
         request: FetchRequest,
         *,
         deadline: float | None = None,
+        page_key: str | None = None,
     ) -> FetchResponse:
         last: AcquisitionError | None = None
         for attempt in range(2):
@@ -1399,6 +1458,14 @@ class WebsiteCollectionKit:
                 raise AcquisitionError(
                     "operation_deadline_exceeded", "collection deadline exceeded"
                 )
+            if state.requests >= state.request_limit:
+                state.limits_reached.add("max_requests")
+                state.stop_reason = StopReason.BUDGET_EXHAUSTED
+                raise AcquisitionError(
+                    "request_budget_exhausted", "request budget exhausted"
+                )
+            if page_key is not None:
+                state.visited.add(page_key)
             state.requests += 1
             try:
                 if remaining is None:
@@ -1415,6 +1482,13 @@ class WebsiteCollectionKit:
                             "operation_deadline_exceeded",
                             "collection deadline exceeded",
                         ) from exc
+                state.bytes_received += len(response.body)
+                if state.bytes_received > state.total_bytes_limit:
+                    state.limits_reached.add("max_total_bytes")
+                    state.stop_reason = StopReason.BUDGET_EXHAUSTED
+                    raise AcquisitionError(
+                        "byte_budget_exhausted", "total response byte budget exhausted"
+                    )
                 if (
                     deadline is not None
                     and asyncio.get_running_loop().time() >= deadline
@@ -1424,6 +1498,18 @@ class WebsiteCollectionKit:
                     raise AcquisitionError(
                         "operation_deadline_exceeded", "collection deadline exceeded"
                     )
+                if request.purpose == "page" and "playwright" in response.fetch_method:
+                    state.rendered_pages += 1
+                    if (
+                        state.rendered_page_limit is not None
+                        and state.rendered_pages > state.rendered_page_limit
+                    ):
+                        state.limits_reached.add("max_rendered_pages")
+                        state.stop_reason = StopReason.BUDGET_EXHAUSTED
+                        raise AcquisitionError(
+                            "rendered_page_budget_exhausted",
+                            "rendered page budget exhausted",
+                        )
                 return response
             except AcquisitionError as exc:
                 last = exc
@@ -1462,13 +1548,11 @@ class WebsiteCollectionKit:
     ) -> CollectionResult:
         route_families = _route_families(state.pages)
         coverage = _coverage(state, frontier, route_families)
-        failed_count = sum(
-            1
-            for issue in state.issues
-            if issue.stage in {"fetch", "interpretation", "discovery"}
-        )
+        failed_count = len(state.failed_pages)
         if state.cancelled:
             status = CollectionStatus.CANCELLED
+        elif state.stop_reason is StopReason.BUDGET_EXHAUSTED:
+            status = CollectionStatus.PARTIAL
         elif state.fatal or (not state.pages and failed_count > 0):
             status = CollectionStatus.FAILED
         elif state.stop_reason is not StopReason.CONVERGED or failed_count:
@@ -1675,6 +1759,7 @@ def _resource_page(
         evidence_refs=evidence_refs,
         profile_ref=f"{profile.profile_id}@{profile.version}" if profile else None,
         discovery_sources=item.sources,
+        request_aliases=item.request_aliases,
     )
 
 
@@ -1713,6 +1798,7 @@ def _unclassified_page(
         evidence_refs=evidence_refs,
         profile_ref=f"{profile.profile_id}@{profile.version}" if profile else None,
         discovery_sources=item.sources,
+        request_aliases=item.request_aliases,
     )
 
 
@@ -1740,7 +1826,7 @@ def _normalise_attachments(
         decision = policy.decide(attachment.url, base_url)
         if decision.accepted:
             yield Attachment(
-                url=decision.canonical_url,
+                url=decision.request_url,
                 name=attachment.name,
                 media_type=attachment.media_type,
             )
@@ -1762,11 +1848,7 @@ def _coverage(
         page_count=len(state.pages),
         excluded_count=len(state.exclusions),
         duplicate_count=frontier.duplicate_count,
-        failed_count=sum(
-            1
-            for issue in state.issues
-            if issue.stage in {"fetch", "interpretation", "discovery"}
-        ),
+        failed_count=len(state.failed_pages),
         frontier_converged=state.stop_reason is StopReason.CONVERGED
         and not frontier.has_pending(),
         limits_reached=tuple(sorted(limits)),

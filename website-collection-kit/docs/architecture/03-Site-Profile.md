@@ -15,15 +15,14 @@ Site Profile 把网站稳定差异从代码中移到可版本化、可审查的�
 ```text
 profile_id / version
 site_ref
-seed_urls
-scope_rules
+seeds
+scope
 route_patterns
-exclusion_rules
+excluded_path_patterns
 discovery_hints
-rendering_hints
-content_hints
-attachment_policy
-registered_strategy_refs
+rendering_required / rendering_fallback
+field_hints
+attachment_extensions
 ```
 
 字段表达的应是站点事实和采集意图，不是供应商部署信息。例如可以声明某类路由“需要渲染后才能出现列表”，但不能填写 CDP 地址或浏览器用户目录。
@@ -36,8 +35,8 @@ registered_strategy_refs
 - 列表、详情、分页和栏目路由模式；
 - 声明式字段提示（当前支持受限 CSS 选择器：标签、`#id`、`.class`、`tag.class`、`[attr=value]`；JSON-LD 仅自动读取日期）；
 - 已知 sitemap、RSS、栏目入口和公开接口提示；
-- 内容类型、附件后缀和大小政策；
-- 具名、版本化、启动时显式注册的策略引用。
+- 内容类型和附件后缀；附件响应大小由获取适配器的单响应上限及本次 `Budget.max_total_bytes` 约束，不由 Profile 声明；
+- 需要独立算法时先在应用层验证，出现第二个真实复用场景后再设计具名策略接口，不在 v0.1 保留无运行语义的策略引用字段。
 
 禁止：
 

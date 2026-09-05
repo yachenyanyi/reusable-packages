@@ -688,7 +688,8 @@ async def test_soft_not_found_page_is_retained_for_later_classification() -> Non
         page.url for page in result.pages
     } == {"https://example.test/", "https://example.test/ghost"}
     assert any(issue.code == "soft_not_found" for issue in result.issues)
-    assert result.coverage.failed_count == 1
+    assert result.coverage.failed_count == 0
+    assert result.status is CollectionStatus.COMPLETED
 
 
 @pytest.mark.asyncio

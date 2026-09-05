@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 
 from ..errors import AcquisitionError, NoAcquisitionCapabilityError
+from ..network import PublicNetworkPolicy
 from ..ports import FetchRequest, FetchResponse
 
 
@@ -22,6 +23,7 @@ class HttpxAcquisition:
         max_response_bytes: int = 8_000_000,
         user_agent: str = "website-collection-kit/0.1",
         trust_env: bool = False,
+        network_policy: PublicNetworkPolicy | None = None,
     ) -> None:
         if timeout_seconds <= 0:
             raise ValueError("timeout_seconds must be positive")
@@ -31,6 +33,7 @@ class HttpxAcquisition:
         self.max_response_bytes = max_response_bytes
         self.user_agent = user_agent
         self.trust_env = trust_env
+        self.network_policy = network_policy or PublicNetworkPolicy()
         self._client = None
 
     async def _ensure_client(self):
@@ -57,6 +60,19 @@ class HttpxAcquisition:
             raise AcquisitionError(
                 "rendering_required",
                 "static HTTP adapter cannot satisfy rendered acquisition",
+            )
+        decision = await self.network_policy.check_url(
+            request.url,
+            method="GET",
+            allow_private_network=bool(
+                request.scope and request.scope.allow_private_network
+            ),
+        )
+        if not decision.accepted:
+            raise AcquisitionError(
+                "network_policy_denied",
+                f"network policy denied {request.url}: {decision.reason}",
+                retryable=decision.reason == "dns_resolution_failed",
             )
         client = await self._ensure_client()
         started = time.perf_counter()

@@ -23,10 +23,6 @@ class RequiredEvidenceUnavailableError(WebsiteCollectionError):
     pass
 
 
-class OperationConflictError(WebsiteCollectionError):
-    pass
-
-
 class AcquisitionError(WebsiteCollectionError):
     """A resource-level acquisition failure with a stable code."""
 

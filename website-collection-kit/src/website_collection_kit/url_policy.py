@@ -21,6 +21,7 @@ from urllib.parse import (
 )
 
 from .contracts import Scope
+from .network import literal_address_reason
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +29,7 @@ class UrlDecision:
     accepted: bool
     canonical_url: str
     reason: str = ""
+    request_url: str = ""
 
 
 class UrlPolicy:
@@ -49,6 +51,32 @@ class UrlPolicy:
                 return ""
         return raw_url
 
+    def request_url(self, raw_url: str, base_url: str | None = None) -> str:
+        """Return a wire URL without applying identity-only normalization."""
+
+        resolved = self.resolve(raw_url, base_url)
+        try:
+            parsed = urlsplit(resolved)
+            if (
+                parsed.scheme.lower() not in {"http", "https"}
+                or not parsed.hostname
+                or parsed.username
+                or parsed.password
+            ):
+                return ""
+            parsed.port
+        except (TypeError, ValueError):
+            return ""
+        return urlunsplit(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path or "/",
+                parsed.query,
+                "",
+            )
+        )
+
     def canonicalize(self, raw_url: str, base_url: str | None = None) -> str:
         resolved = self.resolve(raw_url, base_url)
         try:
@@ -63,6 +91,8 @@ class UrlPolicy:
             hostname = hostname.encode("idna").decode("ascii")
             port = parsed.port
         except (UnicodeError, ValueError):
+            return ""
+        if parsed.username or parsed.password:
             return ""
         netloc = f"[{hostname}]" if ":" in hostname else hostname
         if port is not None and not (
@@ -98,52 +128,80 @@ class UrlPolicy:
         return urlunsplit((scheme, netloc, path, query, ""))
 
     def decide(self, raw_url: str, base_url: str | None = None) -> UrlDecision:
+        request_url = self.request_url(raw_url, base_url)
         canonical = self.canonicalize(raw_url, base_url)
         if not canonical:
-            return UrlDecision(False, "", "unsupported_scheme_or_missing_host")
-        if len(canonical) > self.scope.max_url_length:
-            return UrlDecision(False, canonical, "url_too_long")
+            return UrlDecision(
+                False, "", "unsupported_scheme_or_missing_host", request_url
+            )
+        if len(request_url) > self.scope.max_url_length or len(canonical) > self.scope.max_url_length:
+            return UrlDecision(False, canonical, "url_too_long", request_url)
         try:
             parsed = urlsplit(canonical)
         except ValueError:
-            return UrlDecision(False, canonical, "unsupported_scheme_or_missing_host")
+            return UrlDecision(
+                False, canonical, "unsupported_scheme_or_missing_host", request_url
+            )
         if parsed.scheme not in self.scope.allowed_schemes:
-            return UrlDecision(False, canonical, "scheme_not_allowed")
+            return UrlDecision(False, canonical, "scheme_not_allowed", request_url)
         if not self.scope._host_allowed(parsed.hostname or ""):
-            return UrlDecision(False, canonical, "external_host")
+            return UrlDecision(False, canonical, "external_host", request_url)
+        if not self.scope._origin_allowed(
+            parsed.scheme, parsed.hostname or "", parsed.port
+        ):
+            return UrlDecision(False, canonical, "external_origin", request_url)
+        if (
+            not self.scope.allow_private_network
+            and literal_address_reason(parsed.hostname or "")
+        ):
+            return UrlDecision(False, canonical, "private_network", request_url)
         if self.scope.allowed_path_prefixes and not self._path_allowed(parsed.path):
-            return UrlDecision(False, canonical, "path_outside_scope")
+            return UrlDecision(False, canonical, "path_outside_scope", request_url)
         if any(pattern.search(parsed.path) for pattern in self._excluded):
-            return UrlDecision(False, canonical, "path_excluded")
-        if self.scope.allowed_query_keys:
+            return UrlDecision(False, canonical, "path_excluded", request_url)
+        if self.scope.allowed_query_keys is not None:
             allowed = set(self.scope.allowed_query_keys)
             actual = {
                 key.lower()
                 for key, _ in parse_qsl(parsed.query, keep_blank_values=True)
             }
             if not actual.issubset(allowed):
-                return UrlDecision(False, canonical, "query_key_not_allowed")
-        return UrlDecision(True, canonical)
+                return UrlDecision(False, canonical, "query_key_not_allowed", request_url)
+        return UrlDecision(True, canonical, request_url=request_url)
 
     def decide_auxiliary(
         self, raw_url: str, base_url: str | None = None
     ) -> UrlDecision:
         """Validate robots, sitemap, and feed URLs without widening page scope."""
 
+        request_url = self.request_url(raw_url, base_url)
         canonical = self.canonicalize(raw_url, base_url)
         if not canonical:
-            return UrlDecision(False, "", "unsupported_scheme_or_missing_host")
-        if len(canonical) > self.scope.max_url_length:
-            return UrlDecision(False, canonical, "url_too_long")
+            return UrlDecision(
+                False, "", "unsupported_scheme_or_missing_host", request_url
+            )
+        if len(request_url) > self.scope.max_url_length or len(canonical) > self.scope.max_url_length:
+            return UrlDecision(False, canonical, "url_too_long", request_url)
         try:
             parsed = urlsplit(canonical)
         except ValueError:
-            return UrlDecision(False, canonical, "unsupported_scheme_or_missing_host")
+            return UrlDecision(
+                False, canonical, "unsupported_scheme_or_missing_host", request_url
+            )
         if parsed.scheme not in self.scope.allowed_schemes:
-            return UrlDecision(False, canonical, "scheme_not_allowed")
+            return UrlDecision(False, canonical, "scheme_not_allowed", request_url)
         if not self.scope._host_allowed(parsed.hostname or ""):
-            return UrlDecision(False, canonical, "external_host")
-        return UrlDecision(True, canonical)
+            return UrlDecision(False, canonical, "external_host", request_url)
+        if not self.scope._origin_allowed(
+            parsed.scheme, parsed.hostname or "", parsed.port
+        ):
+            return UrlDecision(False, canonical, "external_origin", request_url)
+        if (
+            not self.scope.allow_private_network
+            and literal_address_reason(parsed.hostname or "")
+        ):
+            return UrlDecision(False, canonical, "private_network", request_url)
+        return UrlDecision(True, canonical, request_url=request_url)
 
     def _path_allowed(self, path: str) -> bool:
         for prefix in self.scope.allowed_path_prefixes:

@@ -42,12 +42,12 @@ from .errors import (
     AcquisitionError,
     InvalidSpecError,
     NoAcquisitionCapabilityError,
-    OperationConflictError,
     ProfileIncompatibleError,
     RequiredEvidenceUnavailableError,
     WebsiteCollectionError,
 )
 from .evidence import MemoryEvidenceStore
+from .network import NetworkDecision, PublicNetworkPolicy
 from .ports import (
     AcquisitionPort,
     EvidencePayload,
@@ -80,13 +80,14 @@ __all__ = [
     "InspectionSpec",
     "InvalidSpecError",
     "MemoryEvidenceStore",
+    "NetworkDecision",
     "NoAcquisitionCapabilityError",
-    "OperationConflictError",
     "PageCandidate",
     "PageIssue",
     "PageType",
     "PlaywrightAcquisition",
     "ProfileDraft",
+    "PublicNetworkPolicy",
     "ProfileIncompatibleError",
     "RenderingRequirement",
     "RequiredEvidenceUnavailableError",

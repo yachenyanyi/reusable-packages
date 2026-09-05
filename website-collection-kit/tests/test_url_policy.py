@@ -78,8 +78,19 @@ def test_malformed_url_is_rejected_without_raising() -> None:
     assert decision.reason == "unsupported_scheme_or_missing_host"
 
 
-def test_ipv6_host_keeps_brackets_during_canonicalization() -> None:
+def test_ipv6_host_is_rejected_by_default() -> None:
     policy = UrlPolicy(Scope.for_seeds(["http://[::1]:8080/"]))
+
+    decision = policy.decide("http://[::1]:8080/page")
+
+    assert not decision.accepted
+    assert decision.reason == "private_network"
+
+
+def test_ipv6_host_keeps_brackets_when_private_network_is_explicitly_allowed() -> None:
+    policy = UrlPolicy(
+        Scope.for_seeds(["http://[::1]:8080/"], allow_private_network=True)
+    )
 
     decision = policy.decide("http://[::1]:8080/page")
 
